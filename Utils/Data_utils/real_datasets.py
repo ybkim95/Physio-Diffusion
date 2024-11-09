@@ -33,55 +33,104 @@ class CustomDataset(Dataset):
         if period == 'train':
             assert ~(predict_length is not None or missing_ratio is not None), ''
         self.name, self.pred_len, self.missing_ratio = name, predict_length, missing_ratio
-        self.style, self.distribution, self.mean_mask_length = style, distribution, mean_mask_length
         self.rawdata, self.scaler = self.read_data(data_root, self.name)
+
+        self.save2npy = save2npy
+        self.auto_norm = neg_one_to_one
+        
+        # Handle context only for wearable dataset
+        if self.name == 'wearable':
+            self.ts_data = self.rawdata[:, :4]  # first 4 columns are time series
+            self.context_data = self.rawdata[:, 4:6]  # last 2 columns are age,gender
+            self.len, self.var_num = self.ts_data.shape[0], self.ts_data.shape[-1]
+            self.data = self.__normalize(self.ts_data)
+        else:
+            self.len, self.var_num = self.rawdata.shape[0], self.rawdata.shape[-1]
+            self.data = self.__normalize(self.rawdata)
+        
+        self.window, self.period = window, period
+        self.sample_num_total = max(self.len - self.window + 1, 0)
+        
+        self.style, self.distribution, self.mean_mask_length = style, distribution, mean_mask_length
+        
         self.dir = os.path.join(output_dir, 'samples')
         os.makedirs(self.dir, exist_ok=True)
 
-        self.window, self.period = window, period
-        self.len, self.var_num = self.rawdata.shape[0], self.rawdata.shape[-1]
-        self.sample_num_total = max(self.len - self.window + 1, 0)
-        self.save2npy = save2npy
-        self.auto_norm = neg_one_to_one
-
-        self.data = self.__normalize(self.rawdata)
         train, inference = self.__getsamples(self.data, proportion, seed)
-
         self.samples = train if period == 'train' else inference
+
         if period == 'test':
             if missing_ratio is not None:
+                if self.name == 'wearable':
+                    masks = np.ones_like(self.samples[0])
+                else:
+                    masks = np.ones_like(self.samples)
                 self.masking = self.mask_data(seed)
             elif predict_length is not None:
-                masks = np.ones(self.samples.shape)
+                if self.name == 'wearable':
+                    masks = np.ones_like(self.samples[0])
+                else:
+                    masks = np.ones_like(self.samples)
                 masks[:, -predict_length:, :] = 0
                 self.masking = masks.astype(bool)
             else:
                 raise NotImplementedError()
-        self.sample_num = self.samples.shape[0]
+
+        if self.name == 'wearable':
+            self.sample_num = self.samples[0].shape[0]  # use time series part for sample count
+        else:
+            self.sample_num = self.samples.shape[0]
 
     def __getsamples(self, data, proportion, seed):
         x = np.zeros((self.sample_num_total, self.window, self.var_num))
+        
+        if self.name == 'wearable':
+            c = np.zeros((self.sample_num_total, 2))  # for age and gender
+        
         for i in range(self.sample_num_total):
             start = i
             end = i + self.window
             x[i, :, :] = data[start:end, :]
+            
+            if self.name == 'wearable':
+                c[i, :] = self.context_data[start, :]
 
-        train_data, test_data = self.divide(x, proportion, seed)
-
-        if self.save2npy:
-            if 1 - proportion > 0:
-                np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_test.npy"), self.unnormalize(test_data))
-            np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_train.npy"), self.unnormalize(train_data))
-            if self.auto_norm:
+        if self.name == 'wearable':
+            train_data, test_data = self.divide(x, proportion, seed)
+            train_context, test_context = self.divide(c, proportion, seed)
+            
+            if self.save2npy:
                 if 1 - proportion > 0:
-                    np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_test.npy"), unnormalize_to_zero_to_one(test_data))
-                np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_train.npy"), unnormalize_to_zero_to_one(train_data))
-            else:
+                    np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_test.npy"), self.unnormalize(test_data))
+                np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_train.npy"), self.unnormalize(train_data))
+                if self.auto_norm:
+                    if 1 - proportion > 0:
+                        np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_test.npy"), unnormalize_to_zero_to_one(test_data))
+                    np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_train.npy"), unnormalize_to_zero_to_one(train_data))
+                else:
+                    if 1 - proportion > 0:
+                        np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_test.npy"), test_data)
+                    np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_train.npy"), train_data)
+            
+            return (train_data, train_context), (test_data, test_context)
+        
+        else:
+            train_data, test_data = self.divide(x, proportion, seed)
+            
+            if self.save2npy:
                 if 1 - proportion > 0:
-                    np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_test.npy"), test_data)
-                np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_train.npy"), train_data)
-
-        return train_data, test_data
+                    np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_test.npy"), self.unnormalize(test_data))
+                np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_train.npy"), self.unnormalize(train_data))
+                if self.auto_norm:
+                    if 1 - proportion > 0:
+                        np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_test.npy"), unnormalize_to_zero_to_one(test_data))
+                    np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_train.npy"), unnormalize_to_zero_to_one(train_data))
+                else:
+                    if 1 - proportion > 0:
+                        np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_test.npy"), test_data)
+                    np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_train.npy"), train_data)
+            
+            return train_data, test_data
 
     def normalize(self, sq):
         d = sq.reshape(-1, self.var_num)
@@ -115,7 +164,6 @@ class CustomDataset(Dataset):
 
         regular_train_num = int(np.ceil(size * ratio))
         id_rdm = np.random.permutation(size)
-        # id_rdm = np.arange(size)
         regular_train_id = id_rdm[:regular_train_num]
         irregular_train_id = id_rdm[regular_train_num:]
 
@@ -128,26 +176,41 @@ class CustomDataset(Dataset):
 
     @staticmethod
     def read_data(filepath, name=''):
-        """Reads a single .csv
-        """
+        """Reads a single .csv"""
         df = pd.read_csv(filepath, header=0)
-        if name == 'etth':
+        if name in ['etth', 'wearable']:
             df.drop(df.columns[0], axis=1, inplace=True)
+            
+        # Get data and scale it
         data = df.values
-        scaler = MinMaxScaler()
-        scaler = scaler.fit(data)
+        
+        if name == 'wearable':
+            # Only scale the time series columns, not the context
+            scaler = MinMaxScaler()
+            scaler = scaler.fit(data[:, :4])  # only fit on time series columns
+        else:
+            scaler = MinMaxScaler()
+            scaler = scaler.fit(data)
+            
         return data, scaler
     
     def mask_data(self, seed=2023):
-        masks = np.ones_like(self.samples)
+        if self.name == 'wearable':
+            masks = np.ones_like(self.samples[0])
+        else:
+            masks = np.ones_like(self.samples)
+            
         # Store the state of the RNG to restore later.
         st0 = np.random.get_state()
         np.random.seed(seed)
 
-        for idx in range(self.samples.shape[0]):
-            x = self.samples[idx, :, :]  # (seq_length, feat_dim) array
+        for idx in range(masks.shape[0]):
+            if self.name == 'wearable':
+                x = self.samples[0][idx, :, :]
+            else:
+                x = self.samples[idx, :, :]
             mask = noise_mask(x, self.missing_ratio, self.mean_mask_length, self.style,
-                              self.distribution)  # (seq_length, feat_dim) boolean array
+                              self.distribution)
             masks[idx, :, :] = mask
 
         if self.save2npy:
@@ -158,16 +221,27 @@ class CustomDataset(Dataset):
         return masks.astype(bool)
 
     def __getitem__(self, ind):
-        if self.period == 'test':
-            x = self.samples[ind, :, :]  # (seq_length, feat_dim) array
-            m = self.masking[ind, :, :]  # (seq_length, feat_dim) boolean array
-            return torch.from_numpy(x).float(), torch.from_numpy(m)
-        x = self.samples[ind, :, :]  # (seq_length, feat_dim) array
-        return torch.from_numpy(x).float()
+        if self.name == 'wearable':
+            if self.period == 'test':
+                x = self.samples[0][ind, :, :]  # time series data
+                c = self.samples[1][ind, :]     # context data
+                m = self.masking[ind, :, :]
+                return torch.from_numpy(x).float(), torch.from_numpy(c).float(), torch.from_numpy(m)
+            
+            x = self.samples[0][ind, :, :]  # time series data
+            c = self.samples[1][ind, :]     # context data
+            return torch.from_numpy(x).float(), torch.from_numpy(c).float()
+        else:
+            if self.period == 'test':
+                x = self.samples[ind, :, :]
+                m = self.masking[ind, :, :]
+                return torch.from_numpy(x).float(), torch.from_numpy(m)
+            x = self.samples[ind, :, :]
+            return torch.from_numpy(x).float()
 
     def __len__(self):
         return self.sample_num
-    
+
 
 class fMRIDataset(CustomDataset):
     def __init__(
@@ -179,8 +253,7 @@ class fMRIDataset(CustomDataset):
 
     @staticmethod
     def read_data(filepath, name=''):
-        """Reads a single .csv
-        """
+        """Reads a single .csv"""
         data = io.loadmat(filepath + '/sim4.mat')['ts']
         scaler = MinMaxScaler()
         scaler = scaler.fit(data)
