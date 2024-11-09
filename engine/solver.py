@@ -2,7 +2,9 @@ import os
 import sys
 import time
 import torch
+import wandb
 import numpy as np
+import torch.nn.functional as F
 
 from pathlib import Path
 from tqdm.auto import tqdm
@@ -11,7 +13,6 @@ from torch.optim import Adam
 from torch.nn.utils import clip_grad_norm_
 from Utils.io_utils import instantiate_from_config, get_model_parameters_info
 
-
 sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
 
 def cycle(dl):
@@ -19,6 +20,27 @@ def cycle(dl):
         for data in dl:
             yield data
 
+def compute_cosine_similarity(pred, target):
+    """
+    Compute cosine similarity between predictions and targets.
+    Returns similarity between -1 and 1, with values closer to 1 indicating higher similarity.
+    """
+    # Reshape if needed - ensure we're computing along the feature dimension
+    # Assuming shape is (batch_size, seq_length, feature_size)
+    if len(pred.shape) == 3:
+        # Reshape to (batch_size * seq_length, feature_size)
+        pred = pred.reshape(-1, pred.shape[-1])
+        target = target.reshape(-1, target.shape[-1])
+
+    # Normalize vectors
+    pred_normalized = F.normalize(pred, p=2, dim=-1)
+    target_normalized = F.normalize(target, p=2, dim=-1)
+    
+    # Compute cosine similarity
+    similarity = F.cosine_similarity(pred_normalized, target_normalized, dim=-1)
+    
+    # Return mean similarity (should be between -1 and 1)
+    return similarity.mean()
 
 class Trainer(object):
     def __init__(self, config, args, model, dataloader, logger=None):
@@ -33,6 +55,20 @@ class Trainer(object):
         self.milestone = 0
         self.args = args
         self.logger = logger
+
+        # Initialize wandb
+        wandb.init(
+            project="Diffusion-TS",
+            name=args.name,
+            config={
+                'model_type': model.__class__.__name__,
+                'seq_length': model.seq_length,
+                'learning_rate': config['solver'].get('base_lr', 1.0e-4),
+                'max_epochs': self.train_num_steps,
+                'gradient_accumulation': self.gradient_accumulate_every,
+                'context_conditioning': model.context_dims > 0
+            }
+        )
 
         self.results_folder = Path(config['solver']['results_folder'] + f'_{model.seq_length}')
         os.makedirs(self.results_folder, exist_ok=True)
@@ -84,46 +120,78 @@ class Trainer(object):
         with tqdm(initial=step, total=self.train_num_steps) as pbar:
             while step < self.train_num_steps:
                 total_loss = 0.
+                total_cosine_sim = 0.
+                
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
-                    loss = self.model(data, target=data)
+                    batch = next(self.dl)
+                    
+                    # Handle different return types from dataset
+                    if isinstance(batch, (list, tuple)):
+                        if len(batch) == 2:  # Training data with context
+                            data, context = batch
+                            data, context = data.to(device), context.to(device)
+                        elif len(batch) == 3:  # Test data with context and mask
+                            data, context, mask = batch
+                            data, context, mask = data.to(device), context.to(device), mask.to(device)
+                    else:
+                        data = batch.to(device)
+                        context = None
+                    
+                    # Forward pass through model with context
+                    loss = self.model(data, context=context, target=data)
                     loss = loss / self.gradient_accumulate_every
                     loss.backward()
+                    
+                    # Get noise prediction
+                    with torch.no_grad():
+                        t = torch.randint(0, self.model.num_timesteps, (data.shape[0],), device=device).long()
+                        noise = torch.randn_like(data)
+                        x_t = self.model.q_sample(data, t, noise=noise)
+                        pred_noise, x_start = self.model.model_predictions(x_t, t, context=context)
+                        
+                        cosine_sim = compute_cosine_similarity(pred_noise, noise)
+                        total_cosine_sim += cosine_sim.item()
+                    
                     total_loss += loss.item()
 
-                pbar.set_description(f'loss: {total_loss:.6f}')
+                avg_loss = total_loss / self.gradient_accumulate_every
+                avg_cosine_sim = total_cosine_sim / self.gradient_accumulate_every
+                
+                pbar.set_description(f'loss: {avg_loss:.6f}, noise_cosine_sim: {avg_cosine_sim:.4f}')
 
                 clip_grad_norm_(self.model.parameters(), 1.0)
                 self.opt.step()
-                self.sch.step(total_loss)
+                self.sch.step(avg_loss)
                 self.opt.zero_grad()
+
+                # Log metrics
+                wandb.log({
+                    'loss': avg_loss,
+                    'noise_cosine_similarity': avg_cosine_sim,
+                    'learning_rate': self.opt.param_groups[0]['lr'],
+                }, step=self.step)
+
+                if self.logger is not None:
+                    self.logger.add_scalar(tag='train/loss', scalar_value=avg_loss, global_step=self.step)
+                    self.logger.add_scalar(tag='train/noise_cosine_similarity', scalar_value=avg_cosine_sim, global_step=self.step)
+
                 self.step += 1
                 step += 1
                 self.ema.update()
 
-                with torch.no_grad():
-                    if self.step != 0 and self.step % self.save_cycle == 0:
-                        self.milestone += 1
-                        self.save(self.milestone)
-                        # self.logger.log_info('saved in {}'.format(str(self.results_folder / f'checkpoint-{self.milestone}.pt')))
-                    
-                    if self.logger is not None and self.step % self.log_frequency == 0:
-                        # info = '{}: train'.format(self.args.name)
-                        # info = info + ': Epoch {}/{}'.format(self.step, self.train_num_steps)
-                        # info += ' ||'
-                        # info += '' if loss_f == 'none' else ' Fourier Loss: {:.4f}'.format(loss_f.item())
-                        # info += '' if loss_r == 'none' else ' Reglarization: {:.4f}'.format(loss_r.item())
-                        # info += ' | Total Loss: {:.6f}'.format(total_loss)
-                        # self.logger.log_info(info)
-                        self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step)
+                if self.step != 0 and self.step % self.save_cycle == 0:
+                    self.milestone += 1
+                    self.save(self.milestone)
 
                 pbar.update(1)
 
         print('training complete')
         if self.logger is not None:
             self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
+        
+        wandb.finish()
 
-    def sample(self, num, size_every, shape=None):
+    def sample(self, num, size_every, shape=None, context=None):
         if self.logger is not None:
             tic = time.time()
             self.logger.log_info('Begin to sample...')
@@ -131,12 +199,14 @@ class Trainer(object):
         num_cycle = int(num // size_every) + 1
 
         for _ in range(num_cycle):
-            sample = self.ema.ema_model.generate_mts(batch_size=size_every)
+            # Pass context to generate_mts
+            sample = self.ema.ema_model.generate_mts(
+                batch_size=size_every, 
+                context=context.to(self.device) if context is not None else None
+            )
             samples = np.row_stack([samples, sample.detach().cpu().numpy()])
             torch.cuda.empty_cache()
 
-        if self.logger is not None:
-            self.logger.log_info('Sampling done, time: {:.2f}'.format(time.time() - tic))
         return samples
 
     def restore(self, raw_dataloader, shape=None, coef=1e-1, stepsize=1e-1, sampling_steps=50):
@@ -150,14 +220,32 @@ class Trainer(object):
         reals = np.empty([0, shape[0], shape[1]])
         masks = np.empty([0, shape[0], shape[1]])
 
-        for idx, (x, t_m) in enumerate(raw_dataloader):
-            x, t_m = x.to(self.device), t_m.to(self.device)
+        for batch in raw_dataloader:
+            if len(batch) == 3:  # data with context and mask
+                x, context, t_m = batch
+                x, context, t_m = x.to(self.device), context.to(self.device), t_m.to(self.device)
+            else:  # data with mask only
+                x, t_m = batch
+                x, t_m = x.to(self.device), t_m.to(self.device)
+                context = None
+
             if sampling_steps == self.model.num_timesteps:
-                sample = self.ema.ema_model.sample_infill(shape=x.shape, target=x*t_m, partial_mask=t_m,
-                                                          model_kwargs=model_kwargs)
+                sample = self.ema.ema_model.sample_infill(
+                    shape=x.shape, 
+                    target=x*t_m, 
+                    partial_mask=t_m,
+                    # context=context,
+                    model_kwargs=model_kwargs
+                )
             else:
-                sample = self.ema.ema_model.fast_sample_infill(shape=x.shape, target=x*t_m, partial_mask=t_m, model_kwargs=model_kwargs,
-                                                               sampling_timesteps=sampling_steps)
+                sample = self.ema.ema_model.fast_sample_infill(
+                    shape=x.shape, 
+                    target=x*t_m, 
+                    partial_mask=t_m, 
+                    # context=context,
+                    model_kwargs=model_kwargs,
+                    sampling_timesteps=sampling_steps
+                )
 
             samples = np.row_stack([samples, sample.detach().cpu().numpy()])
             reals = np.row_stack([reals, x.detach().cpu().numpy()])
@@ -166,4 +254,3 @@ class Trainer(object):
         if self.logger is not None:
             self.logger.log_info('Imputation done, time: {:.2f}'.format(time.time() - tic))
         return samples, reals, masks
-        # return samples
