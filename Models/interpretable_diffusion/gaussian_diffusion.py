@@ -37,6 +37,7 @@ class Diffusion_TS(nn.Module):
             self,
             seq_length,
             feature_size,
+            context_dims=2,
             n_layer_enc=3,
             n_layer_dec=6,
             d_model=None,
@@ -57,6 +58,11 @@ class Diffusion_TS(nn.Module):
     ):
         super(Diffusion_TS, self).__init__()
 
+        self.context_dims = context_dims
+
+        if context_dims > 0:
+            self.context_proj = nn.Linear(context_dims, feature_size)
+
         self.eta, self.use_ff = eta, use_ff
         self.seq_length = seq_length
         self.feature_size = feature_size
@@ -65,6 +71,7 @@ class Diffusion_TS(nn.Module):
         self.model = Transformer(n_feat=feature_size, n_channel=seq_length, n_layer_enc=n_layer_enc, n_layer_dec=n_layer_dec,
                                  n_heads=n_heads, attn_pdrop=attn_pd, resid_pdrop=resid_pd, mlp_hidden_times=mlp_hidden_times,
                                  max_len=seq_length, n_embd=d_model, conv_params=[kernel_size, padding_size], **kwargs)
+
 
         if beta_schedule == 'linear':
             betas = linear_beta_schedule(timesteps)
@@ -115,7 +122,7 @@ class Diffusion_TS(nn.Module):
 
         # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
 
-        register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min=1e-20)))
+        register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min=1e-10)))
         register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
@@ -144,17 +151,23 @@ class Diffusion_TS(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
     
-    def output(self, x, t, padding_masks=None):
+    def output(self, x, t, context=None, padding_masks=None):
+        if context is not None and self.context_dims > 0:
+            # Project context to feature dimension
+            context_emb = self.context_proj(context)
+            # Add context as a bias term
+            x = x + context_emb.unsqueeze(1)  # broadcast across sequence length
+            
         trend, season = self.model(x, t, padding_masks=padding_masks)
         model_output = trend + season
         return model_output
 
-    def model_predictions(self, x, t, clip_x_start=False, padding_masks=None):
+    def model_predictions(self, x, t, context=None, clip_x_start=False, padding_masks=None):
         if padding_masks is None:
             padding_masks = torch.ones(x.shape[0], self.seq_length, dtype=bool, device=x.device)
 
         maybe_clip = partial(torch.clamp, min=-1., max=1.) if clip_x_start else identity
-        x_start = self.output(x, t, padding_masks)
+        x_start = self.output(x, t, context, padding_masks)
         x_start = maybe_clip(x_start)
         pred_noise = self.predict_noise_from_start(x, t, x_start)
         return pred_noise, x_start
@@ -236,13 +249,13 @@ class Diffusion_TS(nn.Module):
                 extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def _train_loss(self, x_start, t, target=None, noise=None, padding_masks=None):
+    def _train_loss(self, x_start, t, context=None, target=None, noise=None, padding_masks=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
         if target is None:
             target = x_start
 
-        x = self.q_sample(x_start=x_start, t=t, noise=noise)  # noise sample
-        model_out = self.output(x, t, padding_masks)
+        x = self.q_sample(x_start=x_start, t=t, noise=noise)
+        model_out = self.output(x, t, context, padding_masks)
 
         train_loss = self.loss_fn(model_out, target, reduction='none')
 
