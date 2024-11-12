@@ -393,6 +393,8 @@ class Transformer(nn.Module):
         block_activate='GELU',
         max_len=2048,
         conv_params=None,
+        context_dims=2,
+        context_method=None,
         **kwargs
     ):
         super().__init__()
@@ -419,11 +421,40 @@ class Transformer(nn.Module):
                                block_activate, condition_dim=n_embd)
         self.pos_dec = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
 
-    def forward(self, input, t, padding_masks=None, return_res=False):
+
+        self.context_dims = context_dims
+        self.context_method = context_method
+        if context_method is None:
+            if not self.context_dims: 
+                self.context_method = 'emb' # default method
+        else:
+            assert self.context_method > 0, f"context_dims must be greater than 0 when context_method is not None"
+            assert self.context_method in ["emb", "encoder", "decoder"]
+            if self.context_method == "decoder":
+                raise NotImplementedError("Decoder context is not implemented yet")
+        if self.context_dims is not None:
+            self.context_proj = nn.Linear(context_dims, n_embd)
+            
+
+    def forward(self, input, t, padding_masks=None, return_res=False, context=None):
         emb = self.emb(input)
         inp_enc = self.pos_enc(emb)
-        enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks)
 
+
+        if self.context_method == "emb":
+            context_emb = self.context_proj(context).unsqueeze(-2)
+            inp_enc = inp_enc + context_emb
+        elif self.context_method == "encoder":
+            context_emb = self.context_proj(context).unsqueeze(-2)
+            inp_enc = torch.cat([context_emb, inp_enc], dim=-2)
+        
+
+        enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks)
+        if self.context_method == "encoder":
+            enc_cond = enc_cond[..., 1:, :]
+        elif self.context_method == "decoder":
+            raise NotImplementedError("Decoder context is not implemented yet")
+        
         inp_dec = self.pos_dec(emb)
         output, mean, trend, season = self.decoder(inp_dec, t, enc_cond, padding_masks=padding_masks)
 

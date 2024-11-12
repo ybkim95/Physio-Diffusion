@@ -54,14 +54,10 @@ class Diffusion_TS(nn.Module):
             padding_size=None,
             use_ff=True,
             reg_weight=None,
+            context_method=None,
             **kwargs
     ):
         super(Diffusion_TS, self).__init__()
-
-        self.context_dims = context_dims
-
-        if context_dims > 0:
-            self.context_proj = nn.Linear(context_dims, feature_size)
 
         self.eta, self.use_ff = eta, use_ff
         self.seq_length = seq_length
@@ -70,7 +66,8 @@ class Diffusion_TS(nn.Module):
 
         self.model = Transformer(n_feat=feature_size, n_channel=seq_length, n_layer_enc=n_layer_enc, n_layer_dec=n_layer_dec,
                                  n_heads=n_heads, attn_pdrop=attn_pd, resid_pdrop=resid_pd, mlp_hidden_times=mlp_hidden_times,
-                                 max_len=seq_length, n_embd=d_model, conv_params=[kernel_size, padding_size], **kwargs)
+                                 max_len=seq_length, n_embd=d_model, conv_params=[kernel_size, padding_size], 
+                                 context_dims=context_dims, context_method=context_method, **kwargs)
 
 
         if beta_schedule == 'linear':
@@ -151,14 +148,8 @@ class Diffusion_TS(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
     
-    def output(self, x, t, context=None, padding_masks=None):
-        if context is not None and self.context_dims > 0:
-            # Project context to feature dimension
-            context_emb = self.context_proj(context)
-            # Add context as a bias term
-            x = x + context_emb.unsqueeze(1)  # broadcast across sequence length
-            
-        trend, season = self.model(x, t, padding_masks=padding_masks)
+    def output(self, x, t, context=None, padding_masks=None):            
+        trend, season = self.model(x, t, padding_masks=padding_masks, context=context)
         model_output = trend + season
         return model_output
 
